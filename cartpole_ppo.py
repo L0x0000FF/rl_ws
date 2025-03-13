@@ -13,16 +13,17 @@ env.reset()
 
 a_size = env.action_space.n
 s_size = env.observation_space.shape[0]
+max_mem_size = 128
 N = 20
 hidden_dim = 128
-total_episodes = 1000
+total_episodes = 2000
 max_steps = 10000
-lr = 0.0005
-lr_a = 0.001
-lr_v = 0.0001
+lr = 0.001
+lr_a = 0.0003
+lr_v = 0.001
 max_grad_norm = 0.5
 gamma = 0.97
-max_epoch = 10
+max_epoch = 3
 
 epsilon = 0.2
 
@@ -73,6 +74,9 @@ class PPOMemory:
     self.rewards.clear()
     self.dones.clear()
     self.log_probs.clear()
+
+  def size(self):
+    return len(self.states)
 
 class PolicyNet(nn.Module):
   def __init__(self,hidden_dim=32):
@@ -128,24 +132,31 @@ class PPOAgent():
       log_prob = torch.log(probs)
       return action.tolist()[0],log_prob.tolist()[0]
 
-  # def getAdvantages(self,rewards:torch.Tensor,values:torch.Tensor):
-  #   with torch.no_grad():
-  #       advantages = torch.zeros_like(rewards)
-  #       rt = torch.zeros_like(values)
-  #       # 从后往前累计奖励
-  #       for t in reversed(range(len(rewards))):
-  #           if t + 1 < len(rewards):
-  #               rt[t] = rewards[t] + gamma * rt[t+1]
-  #           else:
-  #               rt[t] = rewards[t]
-  #       advantages = rt - values
-  #   return advantages, rt
+  def getAdvantages_n_returns(self,rewards:torch.Tensor,values:torch.Tensor,dones:np.ndarray,gae_lambda = 0.9):
+    with torch.no_grad():
+        l = len(values)
+        advantages = []
+        rtgs = []
+        next_adv = 0
+        next_rtgs = 0
+        for i in reversed(range(l)):
+          if dones[i] == True or i+1 >= l:
+            next_adv = 0
+            next_rtgs = 0
+            gae = rewards[i] - values[i]
+          else:
+            gae = rewards[i] + gamma * values[i+1] - values[i]
+          advantages.insert(0,gae + gamma * gae_lambda * next_adv)
+          rtgs.insert(0,rewards[i] + gamma * next_rtgs)
+          next_adv = advantages[0]
+          next_rtgs = rtgs[0]
+    return torch.tensor(advantages,dtype=torch.float).to(device), torch.tensor(rtgs,dtype=torch.float).to(device)
 
   def update(self):
+    states,next_states,actions,log_probs,values,rewards,dones,batches = self.mem.replay()
     for epoch in range(max_epoch):
       la = []
       lv = []
-      states,next_states,actions,log_probs,values,rewards,dones,batches = self.mem.replay()
       states = torch.tensor(states,dtype=torch.float).to(device)
       next_states = torch.tensor(next_states,dtype=torch.float).to(device)
       rewards = torch.tensor(rewards,dtype=torch.float).to(device)
@@ -153,17 +164,19 @@ class PPOAgent():
       log_probs = torch.tensor(log_probs,dtype=torch.float).to(device)
       values = torch.tensor(values,dtype=torch.float).to(device)
       
-      # print(values.shape,self.critic(next_states).squeeze(1).shape)
-      with torch.no_grad():
-        target_v = rewards + gamma * self.critic(next_states).squeeze(1)
-      advantages = (target_v - self.critic(states).squeeze(1)).detach()
+      # with torch.no_grad():
+      #   r_len = len(rewards)
+      #   target_v = torch.zeros_like(values).to(device)
+      #   for i in reversed(range(r_len)):
+      #     target_v[i] = rewards[i] + (gamma * target_v[-1] if i+1 < r_len else 0)
+      advantages,target_v = self.getAdvantages_n_returns(rewards,values,dones)#(target_v - values).detach()
       # print(advantages.shape)
       for batch in batches:
         # batch
         s_batch = states[batch]
         a_batch = actions[batch]
         v_batch = values[batch]
-        target_v_batch = target_v[batch]
+        target_v_batch = target_v[batch].detach()
         adv = advantages[batch]
         log_probs_batch = log_probs[batch]
 
@@ -185,23 +198,26 @@ class PPOAgent():
         surr1 = ratio * adv
         surr2 = torch.clamp(ratio,1-epsilon,1+epsilon) * adv
 
+        # update critic
+        new_v_batch = self.critic(s_batch).squeeze(1)
+        loss_v = F.mse_loss(new_v_batch,target_v_batch)
+        lv.append(loss_v.item())
+        self.critic.opt.zero_grad()
+        loss_v.backward()
+        nn.utils.clip_grad_norm_(self.critic.parameters(), max_grad_norm)
+        self.critic.opt.step()
+        
         loss_a = -torch.min(surr1,surr2)
         self.actor.opt.zero_grad()
         loss_a.mean().backward()
         la.append(loss_a.mean().item())
         nn.utils.clip_grad_norm_(self.actor.parameters(), max_grad_norm)
         self.actor.opt.step()
-        # update critic
-        new_v_batch = self.critic(s_batch).squeeze(1)
-        loss_v = F.mse_loss(new_v_batch,target_v_batch)
-        lv.append(loss_v.mean().item())
-        self.critic.opt.zero_grad()
-        loss_v.mean().backward()
-        nn.utils.clip_grad_norm_(self.critic.parameters(), max_grad_norm)
-        self.critic.opt.step()
+        
       self.loss_a_mean.append(np.sum(la))
       self.loss_v_mean.append(np.sum(lv))
-    self.mem.clearMem()
+    if self.mem.size() >= max_mem_size:
+      self.mem.clearMem()
 
 
 agent = PPOAgent()
